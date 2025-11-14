@@ -4,7 +4,7 @@ import logging
 import os
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 memory_logger = logging.getLogger("memory_service")
 
@@ -78,7 +78,10 @@ def create_ollama_config(
     embedding_model: str = "nomic-embed-text",
     temperature: float = 0.1,
     max_tokens: int = 2000,
-    use_qwen_embeddings: bool = True
+    use_qwen_embeddings: bool = True,
+    request_timeout: Optional[float] = None,
+    chunk_size: Optional[int] = None,
+    embedding_dims: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Create Ollama configuration."""
     return {
@@ -88,7 +91,10 @@ def create_ollama_config(
         "embedding_model": embedding_model,
         "temperature": temperature,
         "max_tokens": max_tokens,
-        "use_qwen_embeddings": use_qwen_embeddings
+        "use_qwen_embeddings": use_qwen_embeddings,
+        "request_timeout": request_timeout,
+        "chunk_size": chunk_size,
+        "embedding_dims": embedding_dims,
     }
 
 
@@ -189,12 +195,12 @@ def build_memory_config_from_env() -> MemoryConfig:
             llm_provider_enum = LLMProvider.OPENAI
             embedding_dims = get_embedding_dims(llm_config)
             memory_logger.info(f"🔧 Setting Embedder dims {embedding_dims}")
-        
+
         elif llm_provider == "ollama":
             base_url = os.getenv("OLLAMA_BASE_URL")
             if not base_url:
                 raise ValueError("OLLAMA_BASE_URL required for Ollama provider")
-            
+
             model = os.getenv("OLLAMA_MODEL")
             if not model:
                 raise ValueError("OLLAMA_MODEL required for Ollama provider")
@@ -203,13 +209,20 @@ def build_memory_config_from_env() -> MemoryConfig:
                 raise ValueError("OLLAMA_EMBEDDER_MODEL required for Ollama provider")
             memory_logger.info(f"🔧 Memory config: LLM={model}, Embedding={embedding_model}, Base URL={base_url}")
 
+            request_timeout = float(os.getenv("OLLAMA_REQUEST_TIMEOUT", "120"))
+            chunk_size = int(os.getenv("OLLAMA_CHUNK_SIZE", "100"))
+            embedding_dims_value = int(os.getenv("OLLAMA_EMBEDDING_DIMS", "768"))
+
             llm_config = create_ollama_config(
                 base_url=base_url,
                 model=model,
                 embedding_model=embedding_model,
+                request_timeout=request_timeout,
+                chunk_size=chunk_size,
+                embedding_dims=embedding_dims_value,
             )
             llm_provider_enum = LLMProvider.OLLAMA
-            embedding_dims = get_embedding_dims(llm_config)
+            embedding_dims = embedding_dims_value
             memory_logger.info(f"🔧 Setting Embedder dims {embedding_dims}")
 
         # Build vector store configuration
@@ -234,6 +247,12 @@ def build_memory_config_from_env() -> MemoryConfig:
         
         memory_logger.info(f"🔧 Memory config: Provider=Friend-Lite, LLM={llm_provider}, VectorStore={vector_store_provider}, Extraction={extraction_enabled}")
         
+        default_timeout = int(os.getenv("MEMORY_TIMEOUT_SECONDS", "1200"))
+        if llm_provider_enum == LLMProvider.OLLAMA:
+            timeout_seconds = int(os.getenv("OLLAMA_TIMEOUT_SECONDS", str(default_timeout)))
+        else:
+            timeout_seconds = int(os.getenv("OPENAI_TIMEOUT_SECONDS", str(default_timeout)))
+
         return MemoryConfig(
             memory_provider=memory_provider_enum,
             llm_provider=llm_provider_enum,
@@ -243,7 +262,7 @@ def build_memory_config_from_env() -> MemoryConfig:
             embedder_config={},  # Included in llm_config
             extraction_prompt=extraction_prompt,
             extraction_enabled=extraction_enabled,
-            timeout_seconds=int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "1200"))
+            timeout_seconds=timeout_seconds
         )
         
     except ImportError:
@@ -293,5 +312,9 @@ def get_embedding_dims(llm_config: Dict[str, Any]) -> int:
             embedding_dims = 768
         else:
             # Default for OpenAI embedding models
-            memory_logger.info(f"Unrecognized embedding model '{embedding_model}', using default dimension {embedding_dims}")
+            memory_logger.info(
+                "Unrecognized embedding model '%s', using default dimension %s",
+                embedding_model,
+                embedding_dims,
+            )
         return embedding_dims

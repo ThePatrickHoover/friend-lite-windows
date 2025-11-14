@@ -17,6 +17,7 @@ from .config import MemoryConfig, VectorStoreProvider
 from .providers import (
     LLMProviderBase,
     OpenAIProvider,
+    OllamaProvider,
     QdrantVectorStore,
     VectorStoreBase,
 )
@@ -69,8 +70,10 @@ class MemoryService(MemoryServiceBase):
 
         try:
             # Initialize LLM provider
-            if self.config.llm_provider in [LLMProviderEnum.OPENAI, LLMProviderEnum.OLLAMA]:
+            if self.config.llm_provider == LLMProviderEnum.OPENAI:
                 self.llm_provider = OpenAIProvider(self.config.llm_config)
+            elif self.config.llm_provider == LLMProviderEnum.OLLAMA:
+                self.llm_provider = OllamaProvider(self.config.llm_config)
             else:
                 raise ValueError(f"Unsupported LLM provider: {self.config.llm_provider}")
 
