@@ -43,7 +43,7 @@ Modern React-based web dashboard located in `./webui/` with:
 ./setup-https.sh your-tailscale-ip
 ```
 
-#### 2. Start Services 
+#### 2. Start Services
 
 **HTTP Mode (Default - No SSL required):**
 ```bash
@@ -60,6 +60,21 @@ docker compose up --build -d
 ```
 - **Web Dashboard**: https://localhost/ or https://your-ip/
 - **Backend API**: https://localhost/api/ or https://your-ip/api/
+
+### Embedding Dimension Overrides
+
+When running in environments without outbound network access you can bypass the
+automatic embedding size detection by setting one of the following variables in
+your `.env` file:
+
+- `MEMORY_EMBEDDING_DIMS` – global override used by every embedding provider.
+- `OPENAI_EMBEDDING_DIMS` – applies when `LLM_PROVIDER=openai`.
+- `OLLAMA_EMBEDDING_DIMS` – applies when `LLM_PROVIDER=ollama` or when running the
+  local Ollama memory stack.
+
+You can also pass `embedding_dims` inside the memory section of the YAML config.
+These overrides allow deployments to pin the expected vector size without
+calling the embedding endpoint first.
 
 #### 3. HTTPS Setup (Optional - For Network Access & Microphone Features)
 

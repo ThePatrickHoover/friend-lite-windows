@@ -4,9 +4,19 @@ import logging
 import os
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 memory_logger = logging.getLogger("memory_service")
+
+_DEFAULT_EMBEDDING_DIM = 1536
+_MODEL_DIM_DEFAULTS = {
+    "text-embedding-3-small": 1536,
+    "text-embedding-3-large": 3072,
+    "text-embedding-ada-002": 1536,
+    "nomic-embed-text:latest": 768,
+    "nomic-embed-text": 768,
+}
+_embedding_dims_cache: Dict[Tuple[str, Optional[str]], int] = {}
 
 
 def _is_langfuse_enabled() -> bool:
@@ -270,51 +280,101 @@ def build_memory_config_from_env() -> MemoryConfig:
         raise
 
 
+def _resolve_embedding_dims_override(llm_config: Dict[str, Any]) -> Optional[int]:
+    """Return a configured override for embedding dimensions if present."""
+    override = (
+        llm_config.get("embedding_dims")
+        or llm_config.get("embedding_dimensions")
+    )
+    if override is None:
+        env_keys = [
+            "MEMORY_EMBEDDING_DIMS",
+            "OPENAI_EMBEDDING_DIMS",
+            "OLLAMA_EMBEDDING_DIMS",
+        ]
+        provider = (os.getenv("LLM_PROVIDER") or "").strip().upper()
+        if provider:
+            env_keys.insert(1, f"{provider}_EMBEDDING_DIMS")
+
+        for key in env_keys:
+            value = os.getenv(key)
+            if value:
+                try:
+                    override = int(value)
+                except (TypeError, ValueError):
+                    memory_logger.warning(
+                        "Invalid value '%s' for %s. Expected integer dimensions.",
+                        value,
+                        key,
+                    )
+                    continue
+                break
+
+    if override is None:
+        return None
+
+    try:
+        return int(override)
+    except (TypeError, ValueError):
+        memory_logger.warning(
+            "Invalid embedding dimension override '%s' in configuration.", override
+        )
+        return None
+
+
 def get_embedding_dims(llm_config: Dict[str, Any]) -> int:
     """
     Query the embedding endpoint and return the embedding vector length.
     Works for OpenAI and OpenAI-compatible endpoints (e.g., Ollama).
     """
-    embedding_model = llm_config.get('embedding_model')
+    embedding_model = llm_config.get("embedding_model")
+    base_url = llm_config.get("base_url")
+    cache_key = (embedding_model, base_url)
+
+    override = _resolve_embedding_dims_override(llm_config)
+    if override is not None:
+        _embedding_dims_cache[cache_key] = override
+        return override
+
+    if cache_key in _embedding_dims_cache:
+        return _embedding_dims_cache[cache_key]
+
+    if not embedding_model:
+        return _DEFAULT_EMBEDDING_DIM
+
     try:
         # Conditionally use Langfuse if configured
         if _is_langfuse_enabled():
             from langfuse.openai import OpenAI
             client = OpenAI(
-                api_key=llm_config.get('api_key'),
-                base_url=llm_config.get('base_url')
+                api_key=llm_config.get("api_key"),
+                base_url=base_url,
             )
         else:
             from openai import OpenAI
             client = OpenAI(
-                api_key=llm_config.get('api_key'),
-                base_url=llm_config.get('base_url')
+                api_key=llm_config.get("api_key"),
+                base_url=base_url,
             )
         response = client.embeddings.create(
             model=embedding_model,
-            input="hello world"
+            input="hello world",
         )
         embedding = response.data[0].embedding
         if not embedding or not isinstance(embedding, list):
-            return 1536
-        return len(embedding)
+            raise ValueError("Embedding response did not contain a vector")
 
-    except (ImportError, KeyError, AttributeError, IndexError, TypeError, ValueError) as e:
-        embedding_dims = 1536 # default
-        memory_logger.exception(f"Failed to get embedding dimensions for model '{embedding_model}'")
-        if embedding_model == "text-embedding-3-small":
-            embedding_dims = 1536
-        elif embedding_model == "text-embedding-3-large":
-            embedding_dims = 3072
-        elif embedding_model == "text-embedding-ada-002":
-            embedding_dims = 1536
-        elif embedding_model == "nomic-embed-text:latest":
-            embedding_dims = 768
-        else:
-            # Default for OpenAI embedding models
-            memory_logger.info(
-                "Unrecognized embedding model '%s', using default dimension %s",
-                embedding_model,
-                embedding_dims,
-            )
+        embedding_dims = len(embedding)
+        _embedding_dims_cache[cache_key] = embedding_dims
         return embedding_dims
+
+    except Exception:
+        fallback = _MODEL_DIM_DEFAULTS.get(embedding_model, _DEFAULT_EMBEDDING_DIM)
+        memory_logger.warning(
+            "Failed to get embedding dimensions for model '%s'. Using fallback %s.",
+            embedding_model,
+            fallback,
+            exc_info=True,
+        )
+        _embedding_dims_cache[cache_key] = fallback
+        return fallback
