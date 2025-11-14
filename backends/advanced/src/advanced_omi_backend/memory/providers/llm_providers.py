@@ -13,6 +13,7 @@ import logging
 import os
 import httpx
 from typing import Any, Dict, List, Optional
+from types import SimpleNamespace
 
 # TODO: Re-enable spacy when Docker build is fixed
 # import spacy
@@ -354,20 +355,196 @@ class OpenAIProvider(LLMProviderBase):
 
 class OllamaProvider(LLMProviderBase):
     """Ollama LLM provider implementation.
-    
+
     Provides memory extraction, embedding generation, and memory action
-    proposals using Ollama's GPT and embedding models.
-    
-    
-    Use the openai provider for ollama with different environment variables
-    
-    os.environ["OPENAI_API_KEY"] = "ollama"  
-    os.environ["OPENAI_BASE_URL"] = "http://localhost:11434/v1"
-    os.environ["QDRANT_BASE_URL"] = "localhost"
-    os.environ["OPENAI_EMBEDDER_MODEL"] = "erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest"
-    
+    proposals using Ollama's OpenAI-compatible chat and embedding endpoints.
     """
-    pass
+
+    def __init__(self, config: Dict[str, Any]):
+        self.base_url = config.get("base_url", "http://localhost:11434/v1").rstrip("/")
+        self.model = config.get("model", "llama2")
+        self.embedding_model = config.get("embedding_model", "nomic-embed-text")
+        self.temperature = config.get("temperature", 0.1)
+        self.max_tokens = config.get("max_tokens", 2000)
+        self.request_timeout = config.get("request_timeout") or config.get("timeout") or 120
+        self.chunk_size = config.get("chunk_size", 100)
+        self.embedding_dims = config.get("embedding_dims")
+        self.api_key = config.get("api_key")
+
+        # Ollama does not require authentication, but honour provided values for
+        # compatibility with other OpenAI-compatible deployments.
+        self._headers: Dict[str, str] = {"Content-Type": "application/json"}
+        if self.api_key and self.api_key != "dummy":
+            self._headers["Authorization"] = f"Bearer {self.api_key}"
+
+    async def extract_memories(self, text: str, prompt: str) -> List[str]:
+        """Extract memories using Ollama chat completion endpoint."""
+        try:
+            system_prompt = prompt if prompt.strip() else FACT_RETRIEVAL_PROMPT
+            text_chunks = chunk_text_with_spacy(text, max_tokens=self.chunk_size)
+
+            async with httpx.AsyncClient(timeout=self.request_timeout, headers=self._headers) as client:
+                chunk_results = []
+                for index, chunk in enumerate(text_chunks):
+                    result = await self._process_chunk(client, system_prompt, chunk, index)
+                    if result:
+                        chunk_results.extend(result)
+
+            return chunk_results
+
+        except Exception as exc:  # pragma: no cover - safety net for runtime issues
+            memory_logger.error(f"Ollama memory extraction failed: {exc}")
+            return []
+
+    async def _process_chunk(
+        self,
+        client: httpx.AsyncClient,
+        system_prompt: str,
+        chunk: str,
+        index: int,
+    ) -> List[str]:
+        """Send a single chunk to the Ollama chat completion endpoint."""
+
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": chunk},
+            ],
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "response_format": {"type": "json_object"},
+        }
+
+        try:
+            data = await self._post(client, "/chat/completions", payload)
+            content = self._extract_choice_content(data)
+            if not content:
+                return []
+            return _parse_memories_content(content)
+        except Exception as exc:  # pragma: no cover - log and continue other chunks
+            memory_logger.error(f"Error processing chunk {index}: {exc}")
+            return []
+
+    async def generate_embeddings(self, texts: List[str]) -> List[List[float]]:
+        """Generate embeddings using Ollama embedding endpoint."""
+
+        if not texts:
+            return []
+
+        payload = {
+            "model": self.embedding_model,
+            "input": texts,
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=self.request_timeout, headers=self._headers) as client:
+                data = await self._post(client, "/embeddings", payload)
+
+            embeddings_data = data.get("data", [])
+            if len(embeddings_data) != len(texts):
+                raise RuntimeError(
+                    "Embedding response size mismatch: "
+                    f"expected {len(texts)}, got {len(embeddings_data)}"
+                )
+
+            return [item.get("embedding", []) for item in embeddings_data]
+
+        except Exception as exc:
+            memory_logger.error(f"Ollama embedding generation failed: {exc}")
+            raise
+
+    async def test_connection(self) -> bool:
+        """Test connectivity with the Ollama service."""
+
+        try:
+            async with httpx.AsyncClient(timeout=self.request_timeout, headers=self._headers) as client:
+                response = await client.get(f"{self.base_url}/models")
+                response.raise_for_status()
+            return True
+        except Exception as exc:
+            memory_logger.error(f"Ollama connection test failed: {exc}")
+            return False
+
+    async def propose_memory_actions(
+        self,
+        retrieved_old_memory: List[Dict[str, str]] | List[str],
+        new_facts: List[str],
+        custom_prompt: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Use Ollama chat completion to propose memory actions."""
+
+        try:
+            update_memory_messages = build_update_memory_messages(
+                retrieved_old_memory,
+                new_facts,
+                custom_prompt,
+            )
+
+            payload = {
+                "model": self.model,
+                "messages": update_memory_messages,
+                "temperature": self.temperature,
+                "max_tokens": self.max_tokens,
+            }
+
+            async with httpx.AsyncClient(timeout=self.request_timeout, headers=self._headers) as client:
+                data = await self._post(client, "/chat/completions", payload)
+
+            content = self._extract_choice_content(data)
+            if not content:
+                return {}
+
+            faux_response = self._to_openai_like_response(content)
+            xml = extract_assistant_xml_from_openai_response(faux_response)
+            memory_logger.info(f"Ollama propose_memory_actions xml: {xml}")
+            items = parse_memory_xml(xml)
+            memory_logger.info(f"Ollama propose_memory_actions items: {items}")
+            result = items_to_json(items)
+            memory_logger.info(f"Ollama propose_memory_actions result: {result}")
+            return result
+
+        except Exception as exc:  # pragma: no cover - external dependency failures
+            memory_logger.error(f"Ollama propose_memory_actions failed: {exc}")
+            return {}
+
+    async def _post(
+        self,
+        client: httpx.AsyncClient,
+        path: str,
+        payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Helper for POST requests against the Ollama OpenAI-compatible API."""
+
+        url = path if path.startswith("http") else f"{self.base_url}{path}"
+        response = await client.post(url, json=payload)
+        response.raise_for_status()
+        return response.json()
+
+    @staticmethod
+    def _extract_choice_content(data: Dict[str, Any]) -> str:
+        """Extract the message content from a chat completion response."""
+
+        try:
+            choices = data.get("choices", [])
+            if not choices:
+                return ""
+            message = choices[0].get("message", {})
+            content = message.get("content")
+            if isinstance(content, list):
+                # Some OpenAI-compatible APIs may return content as a list of parts
+                content = "".join(part.get("text", "") for part in content if isinstance(part, dict))
+            return (content or "").strip()
+        except (AttributeError, IndexError, KeyError, TypeError):  # pragma: no cover - defensive
+            return ""
+
+    @staticmethod
+    def _to_openai_like_response(content: str) -> SimpleNamespace:
+        """Wrap raw content in an OpenAI-like response object for reuse of helpers."""
+
+        message = SimpleNamespace(content=content)
+        choice = SimpleNamespace(message=message)
+        return SimpleNamespace(choices=[choice])
 
 def _parse_memories_content(content: str) -> List[str]:
     """

@@ -5,7 +5,7 @@ and complete memory service implementations for the memory service architecture.
 """
 
 from ..base import LLMProviderBase, VectorStoreBase, MemoryEntry
-from .llm_providers import OpenAIProvider
+from .llm_providers import OpenAIProvider, OllamaProvider
 from .vector_stores import QdrantVectorStore
 
 # Import complete memory service implementations
@@ -28,6 +28,7 @@ __all__ = [
     
     # LLM providers
     "OpenAIProvider",
+    "OllamaProvider",
     
     # Vector stores
     "QdrantVectorStore",
