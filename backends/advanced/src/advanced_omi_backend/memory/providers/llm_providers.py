@@ -432,34 +432,27 @@ class OllamaProvider(LLMProviderBase):
         if not texts:
             return []
 
-        async with httpx.AsyncClient(timeout=self.request_timeout, headers=self._headers) as client:
-            try:
-                # Try a batched request first – OpenAI-compatible servers support this.
-                payload = {
-                    "model": self.embedding_model,
-                    "input": texts,
-                }
+        payload = {
+            "model": self.embedding_model,
+            "input": texts,
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=self.request_timeout, headers=self._headers) as client:
                 data = await self._post(client, "/embeddings", payload)
-                return self._parse_embeddings_payload(data, len(texts))
-            except httpx.HTTPStatusError as exc:
-                # Some Ollama builds only accept a single string per request. Fallback gracefully.
-                memory_logger.info(
-                    "Ollama batch embedding request failed, retrying sequentially: %s",
-                    exc,
+
+            embeddings_data = data.get("data", [])
+            if len(embeddings_data) != len(texts):
+                raise RuntimeError(
+                    "Embedding response size mismatch: "
+                    f"expected {len(texts)}, got {len(embeddings_data)}"
                 )
-                embeddings: List[List[float]] = []
-                for text in texts:
-                    single_payload = {
-                        "model": self.embedding_model,
-                        "input": text,
-                    }
-                    data = await self._post(client, "/embeddings", single_payload)
-                    embedding = self._parse_embeddings_payload(data, 1)[0]
-                    embeddings.append(embedding)
-                return embeddings
-            except Exception as exc:
-                memory_logger.error(f"Ollama embedding generation failed: {exc}")
-                raise
+
+            return [item.get("embedding", []) for item in embeddings_data]
+
+        except Exception as exc:
+            memory_logger.error(f"Ollama embedding generation failed: {exc}")
+            raise
 
     async def test_connection(self) -> bool:
         """Test connectivity with the Ollama service."""
@@ -552,29 +545,6 @@ class OllamaProvider(LLMProviderBase):
         message = SimpleNamespace(content=content)
         choice = SimpleNamespace(message=message)
         return SimpleNamespace(choices=[choice])
-
-    def _parse_embeddings_payload(self, data: Dict[str, Any], expected: int) -> List[List[float]]:
-        """Normalize embedding responses from OpenAI-compatible endpoints."""
-
-        embeddings_data = data.get("data", [])
-        if len(embeddings_data) != expected:
-            raise RuntimeError(
-                "Embedding response size mismatch: "
-                f"expected {expected}, got {len(embeddings_data)}"
-            )
-
-        parsed: List[List[float]] = []
-        for item in embeddings_data:
-            embedding = item.get("embedding")
-            if not isinstance(embedding, list):
-                if self.embedding_dims is not None:
-                    # Provide a deterministic shape even when the backend omits embeddings
-                    parsed.append([0.0] * self.embedding_dims)
-                    continue
-                raise RuntimeError("Embedding response missing vector data")
-            parsed.append(embedding)
-
-        return parsed
 
 def _parse_memories_content(content: str) -> List[str]:
     """
